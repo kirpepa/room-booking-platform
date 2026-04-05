@@ -1,0 +1,12 @@
+go 1.22.0
+
+use (
+	./pkg
+	./services/api-gateway
+	./services/auth-service
+	./services/room-service
+	./services/availability-service
+	./services/booking-service
+	./services/conference-mock-service
+	./tests/e2e
+)
