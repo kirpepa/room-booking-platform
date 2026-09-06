@@ -1,0 +1,9 @@
+.git
+.github
+.idea
+.vscode
+coverage
+keys
+tests
+**/*_test.go
+**/*.out

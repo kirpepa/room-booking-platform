@@ -8,12 +8,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
-	ErrUserNotFound  = errors.New("user not found")
-	ErrEmailExists   = errors.New("email already exists")
+	ErrUserNotFound = errors.New("user not found")
+	ErrEmailExists  = errors.New("email already exists")
 )
 
 type User struct {
@@ -88,18 +89,6 @@ func (r *UserRepository) EnsureUser(ctx context.Context, id uuid.UUID, email str
 }
 
 func isDuplicateKey(err error) bool {
-	return err != nil && (contains(err.Error(), "duplicate key") || contains(err.Error(), "23505"))
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

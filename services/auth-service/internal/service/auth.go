@@ -5,6 +5,8 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"net/mail"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +20,9 @@ var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrInvalidRole        = errors.New("invalid role")
 	ErrEmailExists        = errors.New("email already exists")
+	ErrInvalidEmail       = errors.New("invalid email")
+	ErrInvalidPassword    = errors.New("password must contain 8 to 72 bytes")
+	ErrTestModeDisabled   = errors.New("test task mode is disabled")
 )
 
 var (
@@ -28,12 +33,19 @@ var (
 const tokenTTL = 24 * time.Hour
 
 type AuthService struct {
-	repo       *repository.UserRepository
-	privateKey *rsa.PrivateKey
+	repo         userRepository
+	privateKey   *rsa.PrivateKey
+	testTaskMode bool
 }
 
-func NewAuthService(repo *repository.UserRepository, privateKey *rsa.PrivateKey) *AuthService {
-	return &AuthService{repo: repo, privateKey: privateKey}
+type userRepository interface {
+	Create(ctx context.Context, id uuid.UUID, email string, passwordHash *string, role string) (*repository.User, error)
+	GetByEmail(ctx context.Context, email string) (*repository.User, error)
+	EnsureUser(ctx context.Context, id uuid.UUID, email string, role string) error
+}
+
+func NewAuthService(repo userRepository, privateKey *rsa.PrivateKey, testTaskMode bool) *AuthService {
+	return &AuthService{repo: repo, privateKey: privateKey, testTaskMode: testTaskMode}
 }
 
 type UserResponse struct {
@@ -47,8 +59,15 @@ func (s *AuthService) Register(ctx context.Context, email, password, role string
 	if role != "admin" && role != "user" {
 		return nil, ErrInvalidRole
 	}
-	if email == "" || password == "" {
-		return nil, fmt.Errorf("email and password are required")
+	if role == "admin" && !s.testTaskMode {
+		return nil, ErrTestModeDisabled
+	}
+	email = normalizeEmail(email)
+	if !validEmail(email) {
+		return nil, ErrInvalidEmail
+	}
+	if len(password) < 8 || len(password) > 72 {
+		return nil, ErrInvalidPassword
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -75,6 +94,7 @@ func (s *AuthService) Register(ctx context.Context, email, password, role string
 }
 
 func (s *AuthService) Login(ctx context.Context, email, password string) (string, error) {
+	email = normalizeEmail(email)
 	u, err := s.repo.GetByEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, repository.ErrUserNotFound) {
@@ -91,7 +111,19 @@ func (s *AuthService) Login(ctx context.Context, email, password string) (string
 	return pkgjwt.GenerateToken(s.privateKey, u.ID, u.Role, tokenTTL)
 }
 
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func validEmail(email string) bool {
+	parsed, err := mail.ParseAddress(email)
+	return err == nil && parsed.Address == email && strings.Contains(email, "@")
+}
+
 func (s *AuthService) DummyLogin(ctx context.Context, role string) (string, error) {
+	if !s.testTaskMode {
+		return "", ErrTestModeDisabled
+	}
 	if role != "admin" && role != "user" {
 		return "", ErrInvalidRole
 	}
@@ -114,6 +146,9 @@ func (s *AuthService) DummyLogin(ctx context.Context, role string) (string, erro
 }
 
 func (s *AuthService) Seed(ctx context.Context) error {
+	if !s.testTaskMode {
+		return ErrTestModeDisabled
+	}
 	if err := s.repo.EnsureUser(ctx, DummyAdminID, "admin@test.com", "admin"); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}

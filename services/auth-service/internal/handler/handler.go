@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -10,22 +11,37 @@ import (
 	"github.com/room-booking/services/auth-service/internal/service"
 )
 
-type Handler struct {
-	svc *service.AuthService
-	log *slog.Logger
+type authAPI interface {
+	Register(ctx context.Context, email, password, role string) (*service.UserResponse, error)
+	Login(ctx context.Context, email, password string) (string, error)
+	DummyLogin(ctx context.Context, role string) (string, error)
+	Seed(ctx context.Context) error
 }
 
-func New(svc *service.AuthService, log *slog.Logger) *Handler {
-	return &Handler{svc: svc, log: log}
+type Handler struct {
+	svc          authAPI
+	log          *slog.Logger
+	testTaskMode bool
+}
+
+func New(svc authAPI, log *slog.Logger, testTaskMode bool) *Handler {
+	return &Handler{svc: svc, log: log, testTaskMode: testTaskMode}
 }
 
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
+	r.Get("/_health", h.Health)
 	r.Post("/register", h.Register)
 	r.Post("/login", h.Login)
-	r.Post("/dummyLogin", h.DummyLogin)
-	r.Post("/seed", h.Seed)
+	if h.testTaskMode {
+		r.Post("/dummyLogin", h.DummyLogin)
+		r.Post("/seed", h.Seed)
+	}
 	return r
+}
+
+func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
+	httputil.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +58,10 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		httputil.BadRequest(w, "email, password and role are required")
 		return
 	}
+	if req.Role == "admin" && !h.testTaskMode {
+		httputil.Forbidden(w, "admin accounts cannot be self-registered")
+		return
+	}
 
 	user, err := h.svc.Register(r.Context(), req.Email, req.Password, req.Role)
 	if err != nil {
@@ -51,6 +71,10 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, service.ErrEmailExists) {
 			httputil.BadRequest(w, "email already exists")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidEmail) || errors.Is(err, service.ErrInvalidPassword) {
+			httputil.BadRequest(w, err.Error())
 			return
 		}
 		h.log.Error("register failed", "error", err)

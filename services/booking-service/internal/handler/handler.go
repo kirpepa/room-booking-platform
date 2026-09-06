@@ -32,6 +32,9 @@ func New(svc bookingAPI, log *slog.Logger) *Handler {
 
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
+	r.Get("/_health", func(w http.ResponseWriter, _ *http.Request) {
+		httputil.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 	r.Post("/bookings/create", h.CreateBooking)
 	r.Get("/bookings/list", h.ListBookings)
 	r.Get("/bookings/my", h.MyBookings)

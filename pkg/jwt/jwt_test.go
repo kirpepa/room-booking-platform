@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	jwtv5 "github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -61,12 +62,55 @@ func TestValidateToken_Invalid(t *testing.T) {
 
 func TestValidateToken_Expired(t *testing.T) {
 	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-
-	token, _ := GenerateToken(privateKey, uuid.New(), "user", -1*time.Hour)
+	now := time.Now().UTC()
+	claims := Claims{
+		UserID: uuid.New(),
+		Role:   "user",
+		RegisteredClaims: jwtv5.RegisteredClaims{
+			ExpiresAt: jwtv5.NewNumericDate(now.Add(-time.Hour)),
+			IssuedAt:  jwtv5.NewNumericDate(now.Add(-2 * time.Hour)),
+			Issuer:    "room-booking",
+		},
+	}
+	token, _ := jwtv5.NewWithClaims(jwtv5.SigningMethodRS256, claims).SignedString(privateKey)
 
 	_, err := ValidateToken(&privateKey.PublicKey, token)
 	if err == nil {
 		t.Error("expected error for expired token")
+	}
+}
+
+func TestValidateToken_RejectsWrongAlgorithmAndIssuer(t *testing.T) {
+	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	now := time.Now().UTC()
+	claims := Claims{
+		UserID: uuid.New(),
+		Role:   "user",
+		RegisteredClaims: jwtv5.RegisteredClaims{
+			ExpiresAt: jwtv5.NewNumericDate(now.Add(time.Hour)),
+			IssuedAt:  jwtv5.NewNumericDate(now),
+			Issuer:    "another-issuer",
+		},
+	}
+	wrongIssuer, _ := jwtv5.NewWithClaims(jwtv5.SigningMethodRS256, claims).SignedString(privateKey)
+	if _, err := ValidateToken(&privateKey.PublicKey, wrongIssuer); err == nil {
+		t.Fatal("expected issuer validation error")
+	}
+
+	claims.Issuer = "room-booking"
+	ps256, _ := jwtv5.NewWithClaims(jwtv5.SigningMethodPS256, claims).SignedString(privateKey)
+	if _, err := ValidateToken(&privateKey.PublicKey, ps256); err == nil {
+		t.Fatal("expected strict RS256 algorithm validation error")
+	}
+}
+
+func TestGenerateToken_RejectsInvalidClaims(t *testing.T) {
+	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	if _, err := GenerateToken(privateKey, uuid.Nil, "user", time.Hour); err == nil {
+		t.Fatal("expected nil user id to be rejected")
+	}
+	if _, err := GenerateToken(privateKey, uuid.New(), "owner", time.Hour); err == nil {
+		t.Fatal("expected unknown role to be rejected")
 	}
 }
 

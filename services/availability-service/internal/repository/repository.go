@@ -8,15 +8,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
-	ErrScheduleExists  = errors.New("schedule already exists")
+	ErrScheduleExists   = errors.New("schedule already exists")
 	ErrScheduleNotFound = errors.New("schedule not found")
-	ErrSlotNotFound    = errors.New("slot not found")
-	ErrSlotBooked      = errors.New("slot already booked")
-	ErrSlotInPast      = errors.New("slot is in the past")
+	ErrSlotNotFound     = errors.New("slot not found")
+	ErrSlotBooked       = errors.New("slot already booked")
+	ErrSlotInPast       = errors.New("slot is in the past")
 )
 
 type Schedule struct {
@@ -65,8 +66,8 @@ func (r *Repository) CreateSchedule(ctx context.Context, id, roomID uuid.UUID, d
 		id, roomID, daysOfWeek, startTime, endTime,
 	).Scan(&s.ID, &s.RoomID, &s.DaysOfWeek, &s.StartTime, &s.EndTime, &s.SlotDurationMinutes, &s.CreatedAt)
 	if err != nil {
-		errStr := err.Error()
-		if containsStr(errStr, "duplicate key") || containsStr(errStr, "23505") {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return nil, ErrScheduleExists
 		}
 		return nil, fmt.Errorf("insert schedule: %w", err)
@@ -125,6 +126,9 @@ func (r *Repository) GetFreeSlots(ctx context.Context, roomID uuid.UUID, date ti
 			return nil, fmt.Errorf("scan slot: %w", err)
 		}
 		slots = append(slots, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate free slots: %w", err)
 	}
 	return slots, nil
 }
@@ -230,7 +234,7 @@ func (r *Repository) GenerateSlots(ctx context.Context, schedule *Schedule, from
 		for slotStart.Before(dayEnd) {
 			slotEnd := slotStart.Add(30 * time.Minute)
 			id := uuid.New()
-			_, err := r.pool.Exec(ctx,
+			tag, err := r.pool.Exec(ctx,
 				`INSERT INTO slots (id, room_id, schedule_id, start_at, end_at)
 				 VALUES ($1, $2, $3, $4, $5)
 				 ON CONFLICT (room_id, start_at) DO NOTHING`,
@@ -239,7 +243,7 @@ func (r *Repository) GenerateSlots(ctx context.Context, schedule *Schedule, from
 			if err != nil {
 				return count, fmt.Errorf("insert slot: %w", err)
 			}
-			count++
+			count += int(tag.RowsAffected())
 			slotStart = slotEnd
 		}
 	}
@@ -292,14 +296,8 @@ func (r *Repository) GetAllSchedules(ctx context.Context) ([]Schedule, error) {
 		}
 		schedules = append(schedules, s)
 	}
-	return schedules, nil
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate schedules: %w", err)
 	}
-	return false
+	return schedules, nil
 }

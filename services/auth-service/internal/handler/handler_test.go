@@ -1,89 +1,124 @@
 package handler
 
 import (
-	"encoding/json"
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
+	"github.com/room-booking/services/auth-service/internal/service"
 )
 
-func TestDummyLogin_MissingRole(t *testing.T) {
-	// Test that malformed requests are handled properly
-	// We test the handler's request validation, not the full service
+type stubAuthService struct {
+	registerCalls int
+	dummyCalls    int
+	seedCalls     int
+}
+
+func (s *stubAuthService) Register(_ context.Context, email, _ string, role string) (*service.UserResponse, error) {
+	s.registerCalls++
+	return &service.UserResponse{ID: uuid.New(), Email: email, Role: role}, nil
+}
+
+func (s *stubAuthService) Login(_ context.Context, _, _ string) (string, error) {
+	return "token", nil
+}
+
+func (s *stubAuthService) DummyLogin(_ context.Context, _ string) (string, error) {
+	s.dummyCalls++
+	return "test-token", nil
+}
+
+func (s *stubAuthService) Seed(_ context.Context) error {
+	s.seedCalls++
+	return nil
+}
+
+func testHandler(svc authAPI, testMode bool) http.Handler {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return New(svc, log, testMode).Routes()
+}
+
+func request(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/dummyLogin", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-
-	// Since we can't easily mock the service here, test decoding
-	var body struct {
-		Role string `json:"role"`
-	}
-	if err := json.NewDecoder(strings.NewReader(`{"role":"admin"}`)).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Role != "admin" {
-		t.Errorf("expected admin, got %s", body.Role)
-	}
-
-	_ = rec
-	_ = req
+	h.ServeHTTP(rec, req)
+	return rec
 }
 
-func TestDummyLogin_InvalidJSON(t *testing.T) {
-	var body struct {
-		Role string `json:"role"`
+func TestProductionRoutesDisableTestBackdoors(t *testing.T) {
+	svc := &stubAuthService{}
+	h := testHandler(svc, false)
+
+	if got := request(t, h, "/dummyLogin", `{"role":"admin"}`).Code; got != http.StatusNotFound {
+		t.Fatalf("dummyLogin must be absent outside TEST_TASK_MODE, got %d", got)
 	}
-	err := json.NewDecoder(strings.NewReader(`{invalid`)).Decode(&body)
-	if err == nil {
-		t.Error("expected decode error")
+	if got := request(t, h, "/seed", `{}`).Code; got != http.StatusNotFound {
+		t.Fatalf("seed must be absent outside TEST_TASK_MODE, got %d", got)
+	}
+	if svc.dummyCalls != 0 || svc.seedCalls != 0 {
+		t.Fatal("disabled test endpoints reached the service")
 	}
 }
 
-func TestRegister_DecodeRequest(t *testing.T) {
-	tests := []struct {
-		name  string
-		body  string
-		valid bool
-	}{
-		{"valid", `{"email":"test@test.com","password":"pass","role":"user"}`, true},
-		{"missing email", `{"password":"pass","role":"user"}`, true}, // decodes fine, validated in service
-		{"invalid json", `{bad}`, false},
-	}
+func TestProductionRegistrationCannotCreateAdmin(t *testing.T) {
+	svc := &stubAuthService{}
+	rec := request(t, testHandler(svc, false), "/register",
+		`{"email":"admin@example.com","password":"password123","role":"admin"}`)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var req struct {
-				Email    string `json:"email"`
-				Password string `json:"password"`
-				Role     string `json:"role"`
-			}
-			err := json.NewDecoder(strings.NewReader(tt.body)).Decode(&req)
-			if tt.valid && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if !tt.valid && err == nil {
-				t.Error("expected error")
-			}
-		})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.registerCalls != 0 {
+		t.Fatal("admin self-registration reached the service")
 	}
 }
 
-func TestLogin_DecodeRequest(t *testing.T) {
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-	err := json.NewDecoder(strings.NewReader(`{"email":"a@b.com","password":"p"}`)).Decode(&req)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if req.Email != "a@b.com" {
-		t.Errorf("expected a@b.com, got %s", req.Email)
-	}
+func TestProductionRegistrationAllowsUser(t *testing.T) {
+	svc := &stubAuthService{}
+	rec := request(t, testHandler(svc, false), "/register",
+		`{"email":"user@example.com","password":"password123","role":"user"}`)
 
-	rec := httptest.NewRecorder()
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.registerCalls != 1 {
+		t.Fatalf("expected one registration call, got %d", svc.registerCalls)
+	}
+}
+
+func TestTestModeEnablesDummyLogin(t *testing.T) {
+	svc := &stubAuthService{}
+	rec := request(t, testHandler(svc, true), "/dummyLogin", `{"role":"admin"}`)
+
 	if rec.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", rec.Code)
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.dummyCalls != 1 {
+		t.Fatalf("expected one dummy login call, got %d", svc.dummyCalls)
+	}
+}
+
+func TestRequestRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
+	svc := &stubAuthService{}
+	h := testHandler(svc, false)
+
+	for _, body := range []string{
+		`{"email":"user@example.com","password":"password123","role":"user","isAdmin":true}`,
+		`{"email":"user@example.com","password":"password123","role":"user"} {}`,
+	} {
+		rec := request(t, h, "/register", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %q, got %d", body, rec.Code)
+		}
+	}
+	if svc.registerCalls != 0 {
+		t.Fatal("invalid payload reached the service")
 	}
 }

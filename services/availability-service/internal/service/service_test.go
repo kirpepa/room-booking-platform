@@ -135,6 +135,7 @@ type fakeAvailRepo struct {
 	genCount       int
 	genErr         error
 	upsertErr      error
+	upsertCalls    int
 	genState       *time.Time
 	genStateErr    error
 	allSchedules   []repository.Schedule
@@ -180,6 +181,7 @@ func (f *fakeAvailRepo) GenerateSlots(ctx context.Context, schedule *repository.
 }
 
 func (f *fakeAvailRepo) UpsertGenerationState(ctx context.Context, roomID uuid.UUID, until time.Time) error {
+	f.upsertCalls++
 	return f.upsertErr
 }
 
@@ -305,6 +307,38 @@ func TestExtendSlots_GeneratesAndUpserts(t *testing.T) {
 	s := &AvailabilityService{repo: fr, log: discardLog(), roomServiceURL: ""}
 	if err := s.ExtendSlots(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if fr.upsertCalls != 1 {
+		t.Fatalf("expected generation state update, got %d", fr.upsertCalls)
+	}
+}
+
+func TestCreateSchedule_DoesNotAdvanceStateAfterGenerationFailure(t *testing.T) {
+	rid := uuid.New()
+	fr := &fakeAvailRepo{genErr: io.ErrUnexpectedEOF}
+	s := &AvailabilityService{repo: fr, log: discardLog(), roomServiceURL: ""}
+	req := CreateScheduleRequest{RoomID: rid, DaysOfWeek: []int{1}, StartTime: "09:00", EndTime: "10:00"}
+
+	if _, err := s.CreateSchedule(context.Background(), rid, req); err != nil {
+		t.Fatal(err)
+	}
+	if fr.upsertCalls != 0 {
+		t.Fatal("generation state advanced despite failed slot generation")
+	}
+}
+
+func TestExtendSlots_ReportsPerScheduleFailures(t *testing.T) {
+	rid := uuid.New()
+	fr := &fakeAvailRepo{
+		allSchedules: []repository.Schedule{{ID: uuid.New(), RoomID: rid, StartTime: "09:00", EndTime: "10:00"}},
+		genErr:       io.ErrUnexpectedEOF,
+	}
+	s := &AvailabilityService{repo: fr, log: discardLog(), roomServiceURL: ""}
+	if err := s.ExtendSlots(context.Background()); err == nil {
+		t.Fatal("expected generation failure to reach the worker")
+	}
+	if fr.upsertCalls != 0 {
+		t.Fatal("generation state advanced despite failed slot generation")
 	}
 }
 

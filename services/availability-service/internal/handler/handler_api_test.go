@@ -17,15 +17,15 @@ import (
 )
 
 type stubAvailSvc struct {
-	sched   *repository.Schedule
+	sched    *repository.Schedule
 	schedErr error
-	slots   []repository.Slot
+	slots    []repository.Slot
 	slotsErr error
-	meta    *repository.SlotMeta
-	bookErr error
-	relErr  error
-	slot    *repository.Slot
-	slotErr error
+	meta     *repository.SlotMeta
+	bookErr  error
+	relErr   error
+	slot     *repository.Slot
+	slotErr  error
 }
 
 func (s *stubAvailSvc) CreateSchedule(ctx context.Context, pathRoomID uuid.UUID, req service.CreateScheduleRequest) (*repository.Schedule, error) {

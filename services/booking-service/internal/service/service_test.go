@@ -20,29 +20,42 @@ func testLogger() *slog.Logger {
 }
 
 type memBookingRepo struct {
-	bookings         map[uuid.UUID]*repository.Booking
-	createErr        error
-	cancelResult     *repository.Booking
-	cancelErr        error
-	listUser         []repository.Booking
-	listUserErr      error
-	listAll          []repository.Booking
-	listTotal        int
-	listAllErr       error
-	jobs             []repository.ConferenceJob
-	jobsErr          error
-	confJobCreateErr error
+	bookings           map[uuid.UUID]*repository.Booking
+	createErr          error
+	persistOnCreateErr bool
+	cancelResult       *repository.Booking
+	cancelErr          error
+	cancelCalls        int
+	listUser           []repository.Booking
+	listUserErr        error
+	listAll            []repository.Booking
+	listTotal          int
+	listAllErr         error
+	jobs               []repository.ConferenceJob
+	jobsErr            error
+	completedLink      string
+	completedCalls     int
+	rescheduledCalls   int
+	failedCalls        int
+	discardedCalls     int
+	workerUpdateErr    error
 }
 
-func (m *memBookingRepo) Create(ctx context.Context, b *repository.Booking) error {
-	if m.createErr != nil {
-		return m.createErr
-	}
+func (m *memBookingRepo) CreateWithConferenceJob(ctx context.Context, b *repository.Booking) error {
 	if m.bookings == nil {
 		m.bookings = make(map[uuid.UUID]*repository.Booking)
 	}
+	if m.createErr != nil && !m.persistOnCreateErr {
+		return m.createErr
+	}
 	cp := *b
 	m.bookings[b.ID] = &cp
+	if m.createErr != nil {
+		return m.createErr
+	}
+	if b.ConferenceRequested {
+		m.jobs = append(m.jobs, repository.ConferenceJob{BookingID: b.ID, Status: "pending"})
+	}
 	return nil
 }
 
@@ -59,6 +72,7 @@ func (m *memBookingRepo) GetByID(ctx context.Context, id uuid.UUID) (*repository
 }
 
 func (m *memBookingRepo) Cancel(ctx context.Context, id uuid.UUID) (*repository.Booking, error) {
+	m.cancelCalls++
 	if m.cancelErr != nil {
 		return nil, m.cancelErr
 	}
@@ -91,27 +105,32 @@ func (m *memBookingRepo) ListAll(ctx context.Context, page, pageSize int) ([]rep
 	return m.listAll, m.listTotal, nil
 }
 
-func (m *memBookingRepo) CreateConferenceJob(ctx context.Context, bookingID uuid.UUID) error {
-	return m.confJobCreateErr
-}
-
-func (m *memBookingRepo) GetPendingJobs(ctx context.Context, limit int) ([]repository.ConferenceJob, error) {
+func (m *memBookingRepo) ClaimConferenceJobs(ctx context.Context, limit int, lease time.Duration) ([]repository.ConferenceJob, error) {
 	if m.jobsErr != nil {
 		return nil, m.jobsErr
 	}
 	return m.jobs, nil
 }
 
-func (m *memBookingRepo) UpdateConferenceJob(ctx context.Context, bookingID uuid.UUID, status string, attempts int, nextRetry *time.Time, lastError *string) error {
-	return nil
+func (m *memBookingRepo) RescheduleConferenceJob(ctx context.Context, bookingID uuid.UUID, attempts int, nextRetry time.Time, lastError string) error {
+	m.rescheduledCalls++
+	return m.workerUpdateErr
 }
 
-func (m *memBookingRepo) UpdateConferenceLink(ctx context.Context, bookingID uuid.UUID, link string) error {
-	return nil
+func (m *memBookingRepo) CompleteConferenceJob(ctx context.Context, bookingID uuid.UUID, link string, attempts int) error {
+	m.completedCalls++
+	m.completedLink = link
+	return m.workerUpdateErr
 }
 
-func (m *memBookingRepo) UpdateConferenceStatus(ctx context.Context, bookingID uuid.UUID, status string) error {
-	return nil
+func (m *memBookingRepo) FailConferenceJob(ctx context.Context, bookingID uuid.UUID, attempts int, lastError string) error {
+	m.failedCalls++
+	return m.workerUpdateErr
+}
+
+func (m *memBookingRepo) DiscardConferenceJob(ctx context.Context, bookingID uuid.UUID, attempts int) error {
+	m.discardedCalls++
+	return m.workerUpdateErr
 }
 
 func defaultConfHandler(w http.ResponseWriter, r *http.Request) {
@@ -162,9 +181,9 @@ func TestCreateBooking_MissingSlotID(t *testing.T) {
 func TestCreateBooking_AvailabilityErrors(t *testing.T) {
 	slotID := uuid.New()
 	tests := []struct {
-		name   string
-		code   int
-		body   string
+		name    string
+		code    int
+		body    string
 		wantErr error
 	}{
 		{"not_found", http.StatusNotFound, `{}`, ErrSlotNotFound},
@@ -198,10 +217,10 @@ func TestCreateBooking_Success(t *testing.T) {
 
 	bookFn := func(w http.ResponseWriter, r *http.Request) {
 		meta := map[string]interface{}{
-			"room_id":   roomID.String(),
-			"start_at":  start.Format(time.RFC3339Nano),
-			"end_at":    end.Format(time.RFC3339Nano),
-			"status":    "booked",
+			"room_id":  roomID.String(),
+			"start_at": start.Format(time.RFC3339Nano),
+			"end_at":   end.Format(time.RFC3339Nano),
+			"status":   "booked",
 		}
 		b, _ := json.Marshal(meta)
 		w.Header().Set("Content-Type", "application/json")
@@ -248,6 +267,34 @@ func TestCreateBooking_CompensatesOnRepoCreateFailure(t *testing.T) {
 	}
 	if atomic.LoadInt32(rel) != 1 {
 		t.Fatalf("expected release slot called once, got %d", *rel)
+	}
+}
+
+func TestCreateBooking_ResolvesAmbiguousCommitBeforeCompensation(t *testing.T) {
+	slotID := uuid.New()
+	roomID := uuid.New()
+	start := time.Now().UTC().Add(time.Hour)
+	bookFn := func(w http.ResponseWriter, _ *http.Request) {
+		meta, _ := json.Marshal(map[string]interface{}{
+			"room_id": roomID.String(), "start_at": start.Format(time.RFC3339Nano),
+			"end_at": start.Add(30 * time.Minute).Format(time.RFC3339Nano), "status": "booked",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(meta)
+	}
+	repo := &memBookingRepo{
+		createErr:          repository.ErrCommitOutcomeUnknown,
+		persistOnCreateErr: true,
+	}
+	svc, srv, releases := newTestBookingService(repo, bookFn, nil)
+	defer srv.Close()
+
+	response, err := svc.CreateBooking(context.Background(), uuid.New(), "user", CreateBookingRequest{SlotID: slotID})
+	if err != nil || response == nil {
+		t.Fatalf("expected persisted booking to be returned, response=%+v err=%v", response, err)
+	}
+	if atomic.LoadInt32(releases) != 0 {
+		t.Fatal("must not compensate a transaction that actually committed")
 	}
 }
 
@@ -313,6 +360,23 @@ func TestCancelBooking(t *testing.T) {
 		}
 		if atomic.LoadInt32(rel) != 1 {
 			t.Fatal("expected release")
+		}
+	})
+
+	t.Run("release_failure_keeps_booking_active", func(t *testing.T) {
+		repo := &memBookingRepo{bookings: map[uuid.UUID]*repository.Booking{
+			bid: {ID: bid, UserID: userID, SlotID: slotID, RoomID: roomID, Status: "active"},
+		}}
+		svc, srv, _ := newTestBookingService(repo, nil, func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+		})
+		defer srv.Close()
+
+		if _, err := svc.CancelBooking(context.Background(), bid, userID); err == nil {
+			t.Fatal("expected release failure")
+		}
+		if repo.cancelCalls != 0 {
+			t.Fatal("booking must remain active when the slot release is not confirmed")
 		}
 	})
 }
@@ -388,5 +452,64 @@ func TestProcessConferenceJobs_UpdatesLinkOnSuccess(t *testing.T) {
 
 	if err := svc.ProcessConferenceJobs(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if repo.completedCalls != 1 || repo.completedLink != "https://meet.example/room" {
+		t.Fatalf("conference job was not completed atomically: calls=%d link=%q", repo.completedCalls, repo.completedLink)
+	}
+}
+
+func TestProcessConferenceJobs_ReschedulesTransientFailure(t *testing.T) {
+	bid := uuid.New()
+	repo := &memBookingRepo{
+		jobs: []repository.ConferenceJob{{BookingID: bid, Status: "processing", Attempts: 0}},
+		bookings: map[uuid.UUID]*repository.Booking{
+			bid: {ID: bid, Status: "active"},
+		},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	svc := New(repo, srv.URL, srv.URL, testLogger())
+	svc.httpClient = srv.Client()
+
+	if err := svc.ProcessConferenceJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repo.rescheduledCalls != 1 || repo.failedCalls != 0 {
+		t.Fatalf("expected one retry, rescheduled=%d failed=%d", repo.rescheduledCalls, repo.failedCalls)
+	}
+}
+
+func TestProcessConferenceJobs_PropagatesStateWriteFailure(t *testing.T) {
+	bid := uuid.New()
+	repo := &memBookingRepo{
+		jobs:            []repository.ConferenceJob{{BookingID: bid, Status: "processing"}},
+		bookings:        map[uuid.UUID]*repository.Booking{bid: {ID: bid, Status: "active"}},
+		workerUpdateErr: io.ErrClosedPipe,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(defaultConfHandler))
+	defer srv.Close()
+	svc := New(repo, srv.URL, srv.URL, testLogger())
+	svc.httpClient = srv.Client()
+
+	if err := svc.ProcessConferenceJobs(context.Background()); err == nil {
+		t.Fatal("expected state write error to reach the worker loop")
+	}
+}
+
+func TestProcessConferenceJobs_DiscardsCancelledBooking(t *testing.T) {
+	bid := uuid.New()
+	repo := &memBookingRepo{
+		jobs:     []repository.ConferenceJob{{BookingID: bid, Status: "processing"}},
+		bookings: map[uuid.UUID]*repository.Booking{bid: {ID: bid, Status: "cancelled"}},
+	}
+	svc := New(repo, "http://unused", "http://unused", testLogger())
+
+	if err := svc.ProcessConferenceJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repo.discardedCalls != 1 || repo.completedCalls != 0 {
+		t.Fatalf("cancelled job was not discarded: discarded=%d completed=%d", repo.discardedCalls, repo.completedCalls)
 	}
 }

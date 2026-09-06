@@ -32,13 +32,16 @@ func LoadPrivateKey(path string) (*rsa.PrivateKey, error) {
 	if err != nil {
 		pk, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err2 != nil {
-			return nil, fmt.Errorf("parse private key: %w", err)
+			return nil, fmt.Errorf("parse private key as PKCS1 or PKCS8: %v; %w", err, err2)
 		}
 		rsaKey, ok := pk.(*rsa.PrivateKey)
 		if !ok {
 			return nil, errors.New("not an RSA private key")
 		}
-		return rsaKey, nil
+		key = rsaKey
+	}
+	if key.N.BitLen() < 2048 {
+		return nil, errors.New("RSA private key must be at least 2048 bits")
 	}
 	return key, nil
 }
@@ -60,10 +63,25 @@ func LoadPublicKey(path string) (*rsa.PublicKey, error) {
 	if !ok {
 		return nil, errors.New("not an RSA public key")
 	}
+	if rsaPub.N.BitLen() < 2048 {
+		return nil, errors.New("RSA public key must be at least 2048 bits")
+	}
 	return rsaPub, nil
 }
 
 func GenerateToken(privateKey *rsa.PrivateKey, userID uuid.UUID, role string, ttl time.Duration) (string, error) {
+	if privateKey == nil {
+		return "", errors.New("private key is required")
+	}
+	if userID == uuid.Nil {
+		return "", errors.New("user id is required")
+	}
+	if role != "admin" && role != "user" {
+		return "", errors.New("invalid role")
+	}
+	if ttl <= 0 {
+		return "", errors.New("token ttl must be positive")
+	}
 	now := time.Now().UTC()
 	claims := Claims{
 		UserID: userID,
@@ -79,18 +97,21 @@ func GenerateToken(privateKey *rsa.PrivateKey, userID uuid.UUID, role string, tt
 }
 
 func ValidateToken(publicKey *rsa.PublicKey, tokenStr string) (*Claims, error) {
-	token, err := jwtv5.ParseWithClaims(tokenStr, &Claims{}, func(t *jwtv5.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwtv5.SigningMethodRSA); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
+	if publicKey == nil {
+		return nil, errors.New("public key is required")
+	}
+	token, err := jwtv5.ParseWithClaims(tokenStr, &Claims{}, func(_ *jwtv5.Token) (interface{}, error) {
 		return publicKey, nil
-	})
+	}, jwtv5.WithValidMethods([]string{jwtv5.SigningMethodRS256.Alg()}), jwtv5.WithIssuer("room-booking"))
 	if err != nil {
 		return nil, fmt.Errorf("parse token: %w", err)
 	}
 	claims, ok := token.Claims.(*Claims)
 	if !ok || !token.Valid {
 		return nil, errors.New("invalid token")
+	}
+	if claims.UserID == uuid.Nil || (claims.Role != "admin" && claims.Role != "user") {
+		return nil, errors.New("invalid authorization claims")
 	}
 	return claims, nil
 }

@@ -14,13 +14,13 @@ import (
 var ErrRoomNotFound = errors.New("room not found")
 
 type Room struct {
-	ID          uuid.UUID  `json:"id"`
-	Name        string     `json:"name"`
-	Description *string    `json:"description,omitempty"`
-	Capacity    *int       `json:"capacity,omitempty"`
-	CreatedBy   uuid.UUID  `json:"-"`
-	CreatedAt   time.Time  `json:"createdAt,omitempty"`
-	UpdatedAt   time.Time  `json:"-"`
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Description *string   `json:"description,omitempty"`
+	Capacity    *int      `json:"capacity,omitempty"`
+	CreatedBy   uuid.UUID `json:"-"`
+	CreatedAt   time.Time `json:"createdAt,omitempty"`
+	UpdatedAt   time.Time `json:"-"`
 }
 
 type RoomRepository struct {

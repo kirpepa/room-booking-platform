@@ -16,11 +16,11 @@ import (
 )
 
 type stubRoomStore struct {
-	room  *repository.Room
-	cErr  error
-	list  []repository.Room
-	lErr  error
-	gErr  error
+	room *repository.Room
+	cErr error
+	list []repository.Room
+	lErr error
+	gErr error
 }
 
 func (s *stubRoomStore) Create(ctx context.Context, name string, description *string, capacity *int, createdBy uuid.UUID) (*repository.Room, error) {

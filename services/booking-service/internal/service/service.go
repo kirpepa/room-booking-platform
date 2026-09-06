@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,27 +17,34 @@ import (
 )
 
 var (
-	ErrForbidden      = errors.New("forbidden")
+	ErrForbidden       = errors.New("forbidden")
 	ErrBookingNotFound = errors.New("booking not found")
-	ErrSlotNotFound   = errors.New("slot not found")
-	ErrSlotBooked     = errors.New("slot already booked")
-	ErrSlotInPast     = errors.New("slot in past")
+	ErrSlotNotFound    = errors.New("slot not found")
+	ErrSlotBooked      = errors.New("slot already booked")
+	ErrSlotInPast      = errors.New("slot in past")
 	ErrAdminCannotBook = errors.New("admin cannot create bookings")
 )
 
 // bookingRepository is satisfied by *repository.BookingRepository; narrowed for tests.
 type bookingRepository interface {
-	Create(ctx context.Context, b *repository.Booking) error
+	CreateWithConferenceJob(ctx context.Context, b *repository.Booking) error
 	GetByID(ctx context.Context, id uuid.UUID) (*repository.Booking, error)
 	Cancel(ctx context.Context, id uuid.UUID) (*repository.Booking, error)
 	ListByUser(ctx context.Context, userID uuid.UUID) ([]repository.Booking, error)
 	ListAll(ctx context.Context, page, pageSize int) ([]repository.Booking, int, error)
-	CreateConferenceJob(ctx context.Context, bookingID uuid.UUID) error
-	GetPendingJobs(ctx context.Context, limit int) ([]repository.ConferenceJob, error)
-	UpdateConferenceJob(ctx context.Context, bookingID uuid.UUID, status string, attempts int, nextRetry *time.Time, lastError *string) error
-	UpdateConferenceLink(ctx context.Context, bookingID uuid.UUID, link string) error
-	UpdateConferenceStatus(ctx context.Context, bookingID uuid.UUID, status string) error
+	ClaimConferenceJobs(ctx context.Context, limit int, lease time.Duration) ([]repository.ConferenceJob, error)
+	RescheduleConferenceJob(ctx context.Context, bookingID uuid.UUID, attempts int, nextRetry time.Time, lastError string) error
+	CompleteConferenceJob(ctx context.Context, bookingID uuid.UUID, link string, attempts int) error
+	FailConferenceJob(ctx context.Context, bookingID uuid.UUID, attempts int, lastError string) error
+	DiscardConferenceJob(ctx context.Context, bookingID uuid.UUID, attempts int) error
 }
+
+const (
+	conferenceJobBatchSize = 10
+	conferenceJobLease     = 5 * time.Minute
+	maxConferenceAttempts  = 5
+	maxResponseBodyBytes   = 1 << 20
+)
 
 type BookingService struct {
 	repo                   bookingRepository
@@ -114,24 +122,26 @@ func (s *BookingService) CreateBooking(ctx context.Context, userID uuid.UUID, ro
 		SlotEndAt:           slotMeta.EndAt,
 	}
 
-	if err := s.repo.Create(ctx, booking); err != nil {
+	if err := s.repo.CreateWithConferenceJob(ctx, booking); err != nil {
+		if errors.Is(err, repository.ErrCommitOutcomeUnknown) {
+			persisted, lookupErr := s.repo.GetByID(ctx, bookingID)
+			if lookupErr == nil {
+				return toResponse(persisted), nil
+			}
+			if !errors.Is(lookupErr, repository.ErrBookingNotFound) {
+				s.log.Error("booking commit outcome remains unknown", "error", err, "lookupError", lookupErr, "bookingId", bookingID)
+				return nil, fmt.Errorf("create booking outcome is unknown: %w", errors.Join(err, lookupErr))
+			}
+		}
 		s.log.Error("failed to create booking, compensating", "error", err)
-		_ = s.releaseSlot(ctx, req.SlotID, bookingID)
+		if releaseErr := s.releaseSlot(ctx, req.SlotID, bookingID); releaseErr != nil {
+			s.log.Error("booking compensation failed", "error", releaseErr, "bookingId", bookingID)
+			return nil, fmt.Errorf("create booking and compensate slot: %w", errors.Join(err, releaseErr))
+		}
 		return nil, fmt.Errorf("create booking: %w", err)
 	}
 
-	if req.CreateConferenceLink {
-		if err := s.repo.CreateConferenceJob(ctx, bookingID); err != nil {
-			s.log.Error("failed to create conference job", "error", err)
-		}
-	}
-
-	created, err := s.repo.GetByID(ctx, bookingID)
-	if err != nil {
-		return nil, err
-	}
-
-	return toResponse(created), nil
+	return toResponse(booking), nil
 }
 
 func (s *BookingService) CancelBooking(ctx context.Context, bookingID, userID uuid.UUID) (*BookingResponse, error) {
@@ -153,7 +163,7 @@ func (s *BookingService) CancelBooking(ctx context.Context, bookingID, userID uu
 
 	// Release slot
 	if err := s.releaseSlot(ctx, booking.SlotID, bookingID); err != nil {
-		s.log.Error("release slot failed", "error", err)
+		return nil, fmt.Errorf("release slot: %w", err)
 	}
 
 	cancelled, err := s.repo.Cancel(ctx, bookingID)
@@ -206,14 +216,20 @@ type slotMetaResponse struct {
 }
 
 func (s *BookingService) bookSlot(ctx context.Context, slotID, bookingID uuid.UUID) (*slotMetaResponse, error) {
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"slot_id":    slotID.String(),
 		"booking_id": bookingID.String(),
 	})
+	if err != nil {
+		return nil, fmt.Errorf("encode book slot request: %w", err)
+	}
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
+	req, err := http.NewRequestWithContext(ctx, "POST",
 		s.availabilityServiceURL+"/internal/slots/book",
 		bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create book slot request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.httpClient.Do(req)
@@ -221,7 +237,10 @@ func (s *BookingService) bookSlot(ctx context.Context, slotID, bookingID uuid.UU
 		return nil, fmt.Errorf("call availability service: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := readResponseBody(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read availability response: %w", err)
+	}
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -242,14 +261,20 @@ func (s *BookingService) bookSlot(ctx context.Context, slotID, bookingID uuid.UU
 }
 
 func (s *BookingService) releaseSlot(ctx context.Context, slotID, bookingID uuid.UUID) error {
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"slot_id":    slotID.String(),
 		"booking_id": bookingID.String(),
 	})
+	if err != nil {
+		return fmt.Errorf("encode release slot request: %w", err)
+	}
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
+	req, err := http.NewRequestWithContext(ctx, "POST",
 		s.availabilityServiceURL+"/internal/slots/release",
 		bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create release slot request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.httpClient.Do(req)
@@ -257,30 +282,43 @@ func (s *BookingService) releaseSlot(ctx context.Context, slotID, bookingID uuid
 		return fmt.Errorf("call release: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := readResponseBody(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("release service returned %d; read response: %w", resp.StatusCode, readErr)
+		}
+		return fmt.Errorf("release service returned %d: %s", resp.StatusCode, string(body))
+	}
 	return nil
 }
 
 // ProcessConferenceJobs is called by the worker
 func (s *BookingService) ProcessConferenceJobs(ctx context.Context) error {
-	jobs, err := s.repo.GetPendingJobs(ctx, 10)
+	jobs, err := s.repo.ClaimConferenceJobs(ctx, conferenceJobBatchSize, conferenceJobLease)
 	if err != nil {
-		return fmt.Errorf("get pending jobs: %w", err)
+		return fmt.Errorf("claim pending jobs: %w", err)
 	}
 
+	var processErrors []error
 	for _, job := range jobs {
-		s.processJob(ctx, job)
+		if err := s.processJob(ctx, job); err != nil {
+			s.log.Error("process conference job failed", "bookingId", job.BookingID, "error", err)
+			processErrors = append(processErrors, err)
+		}
 	}
-	return nil
+	return errors.Join(processErrors...)
 }
 
-func (s *BookingService) processJob(ctx context.Context, job repository.ConferenceJob) {
+func (s *BookingService) processJob(ctx context.Context, job repository.ConferenceJob) error {
 	booking, err := s.repo.GetByID(ctx, job.BookingID)
-	if err != nil || booking.Status == "cancelled" {
-		_ = s.repo.UpdateConferenceJob(ctx, job.BookingID, "done", job.Attempts, nil, nil)
-		if booking != nil {
-			_ = s.repo.UpdateConferenceStatus(ctx, job.BookingID, "not_requested")
+	if err != nil {
+		return fmt.Errorf("load booking %s: %w", job.BookingID, err)
+	}
+	if booking.Status == "cancelled" {
+		if err := s.repo.DiscardConferenceJob(ctx, job.BookingID, job.Attempts); err != nil {
+			return fmt.Errorf("discard conference job %s: %w", job.BookingID, err)
 		}
-		return
+		return nil
 	}
 
 	link, err := s.requestConferenceLink(ctx, job.BookingID)
@@ -288,30 +326,41 @@ func (s *BookingService) processJob(ctx context.Context, job repository.Conferen
 		attempts := job.Attempts + 1
 		errStr := err.Error()
 
-		if attempts >= 5 {
-			_ = s.repo.UpdateConferenceJob(ctx, job.BookingID, "failed", attempts, nil, &errStr)
-			_ = s.repo.UpdateConferenceStatus(ctx, job.BookingID, "failed")
-			return
+		if attempts >= maxConferenceAttempts {
+			if updateErr := s.repo.FailConferenceJob(ctx, job.BookingID, attempts, errStr); updateErr != nil {
+				return fmt.Errorf("record terminal conference failure for %s: %w", job.BookingID, updateErr)
+			}
+			return nil
 		}
 
 		backoff := time.Duration(1<<uint(attempts)) * time.Second
 		nextRetry := time.Now().UTC().Add(backoff)
-		_ = s.repo.UpdateConferenceJob(ctx, job.BookingID, "pending", attempts, &nextRetry, &errStr)
-		return
+		if updateErr := s.repo.RescheduleConferenceJob(ctx, job.BookingID, attempts, nextRetry, errStr); updateErr != nil {
+			return fmt.Errorf("reschedule conference job %s: %w", job.BookingID, updateErr)
+		}
+		return nil
 	}
 
-	_ = s.repo.UpdateConferenceLink(ctx, job.BookingID, link)
-	_ = s.repo.UpdateConferenceJob(ctx, job.BookingID, "done", job.Attempts+1, nil, nil)
+	if err := s.repo.CompleteConferenceJob(ctx, job.BookingID, link, job.Attempts+1); err != nil {
+		return fmt.Errorf("complete conference job %s: %w", job.BookingID, err)
+	}
+	return nil
 }
 
 func (s *BookingService) requestConferenceLink(ctx context.Context, bookingID uuid.UUID) (string, error) {
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"booking_id": bookingID.String(),
 	})
+	if err != nil {
+		return "", fmt.Errorf("encode conference request: %w", err)
+	}
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
+	req, err := http.NewRequestWithContext(ctx, "POST",
 		s.conferenceServiceURL+"/internal/conference/create",
 		bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create conference request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.httpClient.Do(req)
@@ -321,7 +370,10 @@ func (s *BookingService) requestConferenceLink(ctx context.Context, bookingID uu
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, readErr := readResponseBody(resp.Body)
+		if readErr != nil {
+			return "", fmt.Errorf("conference service returned %d; read response: %w", resp.StatusCode, readErr)
+		}
 		return "", fmt.Errorf("conference service returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -331,5 +383,21 @@ func (s *BookingService) requestConferenceLink(ctx context.Context, bookingID uu
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
+	parsed, err := url.ParseRequestURI(result.Link)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return "", errors.New("conference service returned an invalid HTTPS link")
+	}
 	return result.Link, nil
+}
+
+func readResponseBody(body io.Reader) ([]byte, error) {
+	limited := io.LimitReader(body, maxResponseBodyBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxResponseBodyBytes {
+		return nil, errors.New("response body exceeds 1 MiB")
+	}
+	return data, nil
 }

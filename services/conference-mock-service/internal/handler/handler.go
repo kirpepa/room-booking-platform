@@ -15,10 +15,10 @@ import (
 )
 
 type Handler struct {
-	store          *store.Store
-	log            *slog.Logger
-	failRate       float64 // 0.0 to 1.0
-	maxDelayMs     int
+	store      *store.Store
+	log        *slog.Logger
+	failRate   float64 // 0.0 to 1.0
+	maxDelayMs int
 }
 
 func New(s *store.Store, log *slog.Logger) *Handler {
@@ -39,6 +39,11 @@ func New(s *store.Store, log *slog.Logger) *Handler {
 
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
+	r.Get("/_health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
 	r.Post("/internal/conference/create", h.CreateConference)
 	return r
 }

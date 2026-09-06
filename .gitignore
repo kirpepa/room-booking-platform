@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.idea/
+.vscode/
+
+# Local secrets and generated artifacts
+keys/*.pem
+coverage/
+*.out
+
+# Go build artifacts
+bin/
+/cmd
+/server

@@ -1,12 +1,14 @@
-go 1.22.0
+go 1.25.0
+
+toolchain go1.25.13
 
 use (
 	./pkg
 	./services/api-gateway
 	./services/auth-service
-	./services/room-service
 	./services/availability-service
 	./services/booking-service
 	./services/conference-mock-service
+	./services/room-service
 	./tests/e2e
 )

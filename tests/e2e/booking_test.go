@@ -166,7 +166,8 @@ func TestFullBookingFlow(t *testing.T) {
 	require.Equal(t, http.StatusOK, myResp.StatusCode)
 	var myBody struct {
 		Bookings []struct {
-			ID string `json:"id"`
+			ID             string  `json:"id"`
+			ConferenceLink *string `json:"conferenceLink"`
 		} `json:"bookings"`
 	}
 	decodeBody(t, myResp, &myBody)
@@ -177,6 +178,32 @@ func TestFullBookingFlow(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "booking should appear in /bookings/my")
+
+	// The background worker must eventually claim the transactionally-created job
+	// and persist the conference link.
+	conferenceReady := false
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		pollResp := getAuth(t, "/bookings/my", userToken)
+		var pollBody struct {
+			Bookings []struct {
+				ID             string  `json:"id"`
+				ConferenceLink *string `json:"conferenceLink"`
+			} `json:"bookings"`
+		}
+		decodeBody(t, pollResp, &pollBody)
+		for _, booking := range pollBody.Bookings {
+			if booking.ID == bookingID && booking.ConferenceLink != nil && *booking.ConferenceLink != "" {
+				conferenceReady = true
+				break
+			}
+		}
+		if conferenceReady {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	require.True(t, conferenceReady, "conference worker did not create a link before the deadline")
 
 	// Step 6: Double-booking same slot should fail
 	doubleBook := postJSONAuth(t, "/bookings/create", map[string]interface{}{
@@ -195,7 +222,9 @@ func TestCancelBookingFlow(t *testing.T) {
 	}, adminToken)
 	require.Equal(t, http.StatusCreated, roomResp.StatusCode)
 	var roomBody struct {
-		Room struct{ ID string `json:"id"` } `json:"room"`
+		Room struct {
+			ID string `json:"id"`
+		} `json:"room"`
 	}
 	decodeBody(t, roomResp, &roomBody)
 	roomID := roomBody.Room.ID
@@ -217,7 +246,9 @@ func TestCancelBookingFlow(t *testing.T) {
 	dateStr := tomorrow.Format("2006-01-02")
 	slotsResp := getAuth(t, fmt.Sprintf("/rooms/%s/slots/list?date=%s", roomID, dateStr), userToken)
 	var slotsBody struct {
-		Slots []struct{ ID string `json:"id"` } `json:"slots"`
+		Slots []struct {
+			ID string `json:"id"`
+		} `json:"slots"`
 	}
 	decodeBody(t, slotsResp, &slotsBody)
 	require.NotEmpty(t, slotsBody.Slots)
@@ -227,7 +258,9 @@ func TestCancelBookingFlow(t *testing.T) {
 	bookResp := postJSONAuth(t, "/bookings/create", map[string]interface{}{"slotId": slotID}, userToken)
 	require.Equal(t, http.StatusCreated, bookResp.StatusCode)
 	var bookBody struct {
-		Booking struct{ ID string `json:"id"` } `json:"booking"`
+		Booking struct {
+			ID string `json:"id"`
+		} `json:"booking"`
 	}
 	decodeBody(t, bookResp, &bookBody)
 	bookingID := bookBody.Booking.ID
@@ -248,7 +281,9 @@ func TestCancelBookingFlow(t *testing.T) {
 	cancelResp2 := postJSONAuth(t, fmt.Sprintf("/bookings/%s/cancel", bookingID), nil, userToken)
 	assert.Equal(t, http.StatusOK, cancelResp2.StatusCode)
 	var cancelBody2 struct {
-		Booking struct{ Status string `json:"status"` } `json:"booking"`
+		Booking struct {
+			Status string `json:"status"`
+		} `json:"booking"`
 	}
 	decodeBody(t, cancelResp2, &cancelBody2)
 	assert.Equal(t, "cancelled", cancelBody2.Booking.Status)
@@ -256,7 +291,9 @@ func TestCancelBookingFlow(t *testing.T) {
 	// Slot should be available again
 	slotsResp2 := getAuth(t, fmt.Sprintf("/rooms/%s/slots/list?date=%s", roomID, dateStr), userToken)
 	var slotsBody2 struct {
-		Slots []struct{ ID string `json:"id"` } `json:"slots"`
+		Slots []struct {
+			ID string `json:"id"`
+		} `json:"slots"`
 	}
 	decodeBody(t, slotsResp2, &slotsBody2)
 	found := false
@@ -285,7 +322,9 @@ func TestScheduleImmutable(t *testing.T) {
 		"name": "Immutable Schedule Room",
 	}, adminToken)
 	var roomBody struct {
-		Room struct{ ID string `json:"id"` } `json:"room"`
+		Room struct {
+			ID string `json:"id"`
+		} `json:"room"`
 	}
 	decodeBody(t, roomResp, &roomBody)
 	roomID := roomBody.Room.ID

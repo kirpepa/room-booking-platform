@@ -1,53 +1,91 @@
-.PHONY: up down seed test lint swagger cover migrate build
+GO_MODULES := pkg \
+	services/api-gateway \
+	services/auth-service \
+	services/room-service \
+	services/availability-service \
+	services/booking-service \
+	services/conference-mock-service
+SELECTED_GO := $(shell go env GOROOT)/bin/go
+GATEWAY_PORT ?= 8080
+BASE_URL ?= http://localhost:$(GATEWAY_PORT)
+
+.PHONY: up down seed build test test-race test-e2e cover fmt-check vet verify vuln lint swagger migrate logs restart compose-config
 
 up:
-	docker compose up --build -d
-	@echo "Waiting for services to be ready..."
-	@sleep 8
-	@echo "Services are up at http://localhost:8080"
-	@$(MAKE) seed
+	GATEWAY_PORT=$(GATEWAY_PORT) TEST_TASK_MODE=true docker compose up --build -d --wait --wait-timeout 180
+	@$(MAKE) seed GATEWAY_PORT=$(GATEWAY_PORT)
+	@echo "Services are ready at http://localhost:$(GATEWAY_PORT)"
 
 down:
 	docker compose down -v
 
 seed:
-	@chmod +x scripts/seed.sh
-	@bash scripts/seed.sh http://localhost:8080
+	@bash scripts/seed.sh http://localhost:$(GATEWAY_PORT)
 
 build:
-	@for svc in auth-service room-service availability-service booking-service conference-mock-service api-gateway; do \
-		echo "Building $$svc..."; \
-		cd services/$$svc && go build ./cmd/ && cd ../..; \
+	set -e; for module_dir in $(GO_MODULES); do \
+		echo "Building $$module_dir"; \
+		(cd $$module_dir && go build ./...); \
 	done
 
 test:
-	@echo "Running unit tests..."
-	@for svc in auth-service room-service availability-service booking-service; do \
-		echo "Testing $$svc..."; \
-		cd services/$$svc && go test ./... -v -count=1 && cd ../..; \
+	@set -e; for module_dir in $(GO_MODULES); do \
+		echo "Testing $$module_dir"; \
+		(cd $$module_dir && go test ./... -count=1); \
 	done
-	@cd pkg && go test ./... -v -count=1 && cd ..
 
-cover:
-	@echo "Running tests with coverage..."
-	@mkdir -p coverage
-	@for svc in auth-service room-service availability-service booking-service; do \
-		echo "Coverage $$svc..."; \
-		cd services/$$svc && go test ./... -coverprofile=../../coverage/$$svc.out -count=1 && cd ../..; \
+test-race:
+	@set -e; for module_dir in $(GO_MODULES); do \
+		echo "Race testing $$module_dir"; \
+		(cd $$module_dir && go test ./... -race -count=1); \
 	done
-	@cd pkg && go test ./... -coverprofile=../coverage/pkg.out -count=1 && cd ..
-	@echo "Coverage reports in coverage/"
 
 test-e2e:
-	@echo "Running E2E tests..."
-	cd tests/e2e && go test -v -count=1 -timeout 120s ./...
+	@cd tests/e2e && BASE_URL=$(BASE_URL) go test -v -count=1 -timeout 120s ./...
+
+cover:
+	@mkdir -p coverage
+	@coverage_dir="$(CURDIR)/coverage"; \
+	set -e; for module_dir in $(GO_MODULES); do \
+		module_name=$$(basename $$module_dir); \
+		echo "Coverage $$module_dir"; \
+		(cd $$module_dir && go test ./... -coverprofile="$$coverage_dir/$$module_name.out" -count=1); \
+	done
+	@echo "Coverage reports are in coverage/"
+
+fmt-check:
+	@unformatted=$$(gofmt -l $$(find pkg services tests -type f -name '*.go')); \
+	if [ -n "$$unformatted" ]; then \
+		echo "The following files need gofmt:"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+
+vet:
+	@set -e; for module_dir in $(GO_MODULES); do \
+		echo "Vetting $$module_dir"; \
+		(cd $$module_dir && go vet ./...); \
+	done
+
+compose-config:
+	docker compose config --quiet
+
+verify: fmt-check vet test-race build compose-config
+
+vuln:
+	@set -e; for module_dir in $(GO_MODULES); do \
+		echo "Scanning $$module_dir"; \
+		(cd $$module_dir && GOTOOLCHAIN=local "$(SELECTED_GO)" run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...); \
+	done
 
 lint:
-	@golangci-lint run ./...
+	@set -e; for module_dir in $(GO_MODULES); do \
+		echo "Linting $$module_dir"; \
+		(cd $$module_dir && golangci-lint run ./...); \
+	done
 
 swagger:
-	@echo "Swagger is served from api.yaml at http://localhost:8080"
-	@echo "Copy api.yaml to services/api-gateway if needed"
+	@echo "OpenAPI specification: api.yaml"
 
 migrate:
 	docker compose run --rm migrate

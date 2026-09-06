@@ -30,6 +30,9 @@ func New(repo roomStore, log *slog.Logger) *Handler {
 
 func (h *Handler) Routes() http.Handler {
 	r := chi.NewRouter()
+	r.Get("/_health", func(w http.ResponseWriter, _ *http.Request) {
+		httputil.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 	// Public (proxied from gateway)
 	r.Post("/rooms/create", h.CreateRoom)
 	r.Get("/rooms/list", h.ListRooms)

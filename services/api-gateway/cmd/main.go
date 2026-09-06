@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -49,7 +50,9 @@ func main() {
 	// Auth endpoints - no auth required
 	r.Post("/register", proxyTo(cfg.AuthServiceURL, "/register"))
 	r.Post("/login", proxyTo(cfg.AuthServiceURL, "/login"))
-	r.Post("/dummyLogin", proxyTo(cfg.AuthServiceURL, "/dummyLogin"))
+	if cfg.TestTaskMode {
+		r.Post("/dummyLogin", proxyTo(cfg.AuthServiceURL, "/dummyLogin"))
+	}
 
 	// Protected routes
 	r.Group(func(r chi.Router) {
@@ -86,8 +89,12 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", cfg.Port),
-		Handler: r,
+		Addr:              fmt.Sprintf(":%s", cfg.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -101,6 +108,11 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("graceful shutdown failed", "error", err)
+	}
 	log.Info("api-gateway stopped")
 }
 

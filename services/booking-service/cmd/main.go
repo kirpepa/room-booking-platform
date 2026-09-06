@@ -24,11 +24,18 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	cancel()
 	if err != nil {
+		cancel()
 		log.Error("failed to connect to database", "error", err)
 		os.Exit(1)
 	}
+	if err := pool.Ping(ctx); err != nil {
+		cancel()
+		pool.Close()
+		log.Error("failed to ping database", "error", err)
+		os.Exit(1)
+	}
+	cancel()
 	defer pool.Close()
 
 	repo := repository.New(pool)
@@ -42,8 +49,12 @@ func main() {
 	go w.Start(workerCtx)
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", cfg.Port),
-		Handler: h.Routes(),
+		Addr:              fmt.Sprintf(":%s", cfg.Port),
+		Handler:           h.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -61,6 +72,8 @@ func main() {
 	workerCancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("graceful shutdown failed", "error", err)
+	}
 	log.Info("booking-service stopped")
 }
